@@ -88,22 +88,33 @@ export async function runParallelDemo() {
     check(ctx, 'three independent tickets', tickets.length === 3, tickets.map(ticket => ticket.id).join(','))
     runtime.log.info(`[demo] tickets ${tickets.map(ticket => ticketLine(ticket)).join(' | ')}`)
 
-    const sessionIds = tickets.map(ticket => ticket.assignments.at(-1)?.workerSessionId ?? '')
+    // A remote model needs seconds per turn, so wait for the burst to land
+    // instead of reading the store the instant ingest returns.
+    const sessionIds = await waitFor(() => {
+      const ids = runtime.store.listDocs<Ticket>('ticket')
+        .map(ticket => ticket.assignments.at(-1)?.workerSessionId ?? '')
+      return ids.length === 3 && ids.every(Boolean) ? ids : undefined
+    }, 30_000, 100)
     check(
       ctx,
       'each ticket has a distinct worker session',
-      new Set(sessionIds).size === 3 && sessionIds.every(Boolean),
-      `sessions=${sessionIds.join(',')}`,
+      sessionIds != null && new Set(sessionIds).size === 3,
+      `sessions=${sessionIds?.join(',') ?? '-'}`,
     )
 
-    const started = tickets
-      .map(ticket => Date.parse(ticket.assignments.at(-1)?.startedAt ?? ''))
-      .filter(value => Number.isFinite(value))
-    const spreadMs = started.length === 3 ? Math.max(...started) - Math.min(...started) : Number.NaN
+    const startedAt = await waitFor(() => {
+      const values = runtime.store.listDocs<Ticket>('ticket')
+        .map(ticket => Date.parse(ticket.assignments.at(-1)?.startedAt ?? ''))
+        .filter(value => Number.isFinite(value))
+      return values.length === 3 ? values : undefined
+    }, 30_000, 100)
+    const spreadMs = startedAt ? Math.max(...startedAt) - Math.min(...startedAt) : Number.NaN
     check(
       ctx,
       'all three assignments started in the same burst',
-      started.length === 3 && spreadMs < 5_000,
+      // The burst guarantee is admission order, not model speed: each ticket's
+      // Eval turn costs a live model call before its assignment starts.
+      startedAt != null && spreadMs < 15_000,
       `startedAt spread=${spreadMs}ms`,
     )
 
@@ -117,11 +128,12 @@ export async function runParallelDemo() {
 
     for (const ticket of tickets) {
       const sessionId = `worker_${ticket.id}`
-      check(
-        ctx,
-        `worker session started ${sessionId}`,
-        countLines(runtime, `ExecutorSession start session=${sessionId}`) === 1,
+      const startedLine = await waitFor(
+        () => countLines(runtime, `ExecutorSession start session=${sessionId}`) === 1,
+        30_000,
+        100,
       )
+      check(ctx, `worker session started ${sessionId}`, startedLine != null)
     }
 
     // 4. Every ticket must be tied to a real API issue, not a synthetic trigger.

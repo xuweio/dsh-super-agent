@@ -56,7 +56,7 @@ export async function runWatchdogDemo() {
     check(
       ctx,
       'worker session started from real GitHub activity',
-      await waitFor(() => countLines(runtime, 'ExecutorSession start session=worker_') >= 1, 10_000, 100) != null,
+      await waitFor(() => countLines(runtime, 'ExecutorSession start session=worker_') >= 1, 30_000, 100) != null,
     )
 
     const nudged = await waitFor(
@@ -73,13 +73,30 @@ export async function runWatchdogDemo() {
     )
     check(ctx, 'watchdog failed the stuck assignment on the next tick', failed != null, failed ?? 'no fail before deadline')
 
+    // A watchdog fail is a failed report: it ends the Assignment and leaves the
+    // Ticket open for retry (assignments.report), and a Ticket that does end is
+    // always ended by the executor. Assert that terminal shape, not `by`.
     const ticket = await waitFor(() => {
       const docs = runtime.store.listDocs<Ticket>('ticket')
-      return docs.find(item => item.ended?.by === 'watchdog')
-    }, 10_000, 100)
-    check(ctx, 'ticket ended by watchdog', ticket != null, ticket ? ticketLine(ticket) : 'no watchdog-ended ticket')
+      return docs.find(item => {
+        const latest = item.assignments.at(-1)
+        return latest?.state === 'ended' && latest.report?.kind === 'failed'
+      })
+    }, 20_000, 100)
+    check(
+      ctx,
+      'watchdog failed the assignment on the ticket',
+      ticket != null,
+      ticket ? ticketLine(ticket) : 'no watchdog-failed assignment',
+    )
 
     if (ticket) {
+      check(
+        ctx,
+        'ticket stays open for retry after a watchdog fail',
+        ticket.ended == null,
+        ticket.ended ? `ended=${ticket.ended.outcome}/${ticket.ended.by}` : 'ended=-',
+      )
       const origin = originTrigger(runtime.store, ticket)
       const issueNumber = issueNumberForTicket(ticket)
       check(
@@ -113,7 +130,7 @@ export async function runWatchdogDemo() {
       const proof = await verifyGithubOutbound(github, ticket, runtime.store)
       check(ctx, `real GitHub comment for #${issue.number}`, proof.ok, proof.detail)
 
-      // The watchdog is the reason the ticket ended; a live model call still
+      // The watchdog is the reason the assignment ended; a live model call still
       // proves the worker was real. Do not wait for the whole stalled turn.
       const latency = await waitFor(() => {
         const snapshot = runtime.metrics.snapshot().modelLatencyMs
